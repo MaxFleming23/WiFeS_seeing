@@ -1,0 +1,3 @@
+[submodule "mirar"]
+	path = mirar
+	url = https://github.com/astqx/mirar.git
