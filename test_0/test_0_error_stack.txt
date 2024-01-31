@@ -1,0 +1,8 @@
+Error report summarising 0 errors. 
+Code version: mirar==0.10.2 
+ 
+0/0 errors were errors not raised by mirar. 
+The remaining 0/0 errors were known errors raised by mirar. 
+An additional 0 non-critical errors were raised. 
+
+ No raised errors found in processing
