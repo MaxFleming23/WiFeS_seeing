@@ -23,13 +23,14 @@ Evaluating the image quality or "seeing" at exposure commencement.
 Developing a robust codebase for consistent analysis across different data sets.
 .RE
 
+
+Text
+
+.PSPIC figure.eps
+
+
 .SH METHODOLOGY
 .PP
-The project methodology encompasses the following key steps:
-.RS
-.IP \(bu
-\&\fBDownload the
-
 
 .IP \(bu
 \&\fBRun an object finder on the images:\fR Utilize a Python version of the SExtractor software (https://sep.readthedocs.io/en/v1.1.x/) to identify celestial bodies within the acquisition images. This process will involve parsing and leveraging image metadata such as FILTER, EXPTIME, MJD-OBS, AIRMASS, RA, DEC, TELPAN, CRPIX1, CRPIX2, CD1_1, CD1_2, CD2_1, and CD2_2.
