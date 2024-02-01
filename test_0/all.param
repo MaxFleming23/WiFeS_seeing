@@ -34,6 +34,46 @@ def dump_object(data,path):
     with open(path,'wb') as file:
         return pickle.dump(data,file)
 
+class WifesAutoguiderVisier:
+    
+    def __init__(
+        self,
+        visier_catalog: VizierCatalog,
+        cache: bool = False,
+    ):
+        self.visier_catalog = visier_catalog
+        self.cache = cache
+        
+    def generator(
+        self,
+        image: Image,
+    ) -> VizierCatalog | CatalogFromFile:
+        
+        filter_name = image["FILTER"]
+
+        search_radius_arcmin = (
+            np.max([image["NAXIS1"], image["NAXIS2"]])
+            * np.max([np.abs(image["CD1_1"]), np.abs(image["CD1_2"])])
+            * 60
+        ) / 2.0
+        
+        # TODO: match closest
+        if filter_name == 'I':
+            filter_name = 'RP'
+
+        return self.visier_catalog(
+            min_mag=10,
+            max_mag=20,
+            search_radius_arcmin=search_radius_arcmin,
+            filter_name=filter_name,
+            cache_catalog_locally=self.cache,
+        )
+    
+def wifes_autoguider_photometric_catalog_purifier(
+    
+) -> Table:
+    return 
+
 class PhotutilsBkgSubtractor(BaseImageProcessor):
     
     base_key = "photutilsbkgsubtractor"
@@ -296,6 +336,7 @@ class PhotutilsSourceFinder(BaseImageProcessor):
             
         return batch
 
+# multiple aperture
 class PhotutilsSourceCatalog(BaseSourceGenerator):
     """
     Args
@@ -381,6 +422,11 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
                     background = self.background
             else:
                 background = None
+                
+            if self.wcs is None:
+                wcs = WCS(header=header)
+            else:
+                wcs = self.wcs
             
             srccat = SourceCatalog(
                 data=data,
@@ -389,7 +435,7 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
                 error=error,
                 mask=self.mask,
                 background=background,
-                wcs=self.wcs,
+                wcs=wcs,
                 localbkg_width=self.localbkg_width,
                 apermask_method=self.apermask_method,
                 kron_params = self.kron_params,
@@ -406,6 +452,13 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             srccat_table['elong'] = srccat.elongation
             srccat_table[XPOS_KEY] = srccat.xcentroid
             srccat_table[YPOS_KEY] = srccat.ycentroid
+            srccat_table['xcentroid_win'] = srccat.xcentroid_win
+            srccat_table['ycentroid_win'] = srccat.ycentroid_win
+            srccat_table['sky_centroid_icrs'] = srccat.sky_centroid_icrs
+            srccat_table['sky_centroid_win'] = srccat.sky_centroid_win
+            # logger.debug(srccat.sky_centroid_win)
+            srccat_table['ALPHAWIN_J2000'] = [coords.ra for coords in srccat.sky_centroid_win]
+            srccat_table['DELTAWIN_J2000'] = [coords.dec for coords in srccat.sky_centroid_win]
             # cov_eigvals = srccat.covariance_eigvals
             # srccat_table['cov_eigvals'] = cov_eigvals
             # srccat_table['aimage'] = cov_eigvals[0]
@@ -415,12 +468,14 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             srccat_table['THETA_IMAGE'] = srccat.orientation
             srccat_table['kron_aperture'] = srccat.kron_aperture
             
+            # TODO: CHANGE!!
+            srccat_table['FLAGS'] = 0
             
             # mirar compatability
             srccat_table[DIFF_IMG_KEY] = image[LATEST_SAVE_KEY] # has to be 
             srccat_table[SCI_IMG_KEY] = '' #image[LATEST_SAVE_KEY]
             srccat_table[REF_IMG_KEY] = ''
-            
+    
             if self.make_psf_cutouts:
                 # TODO: check if/what different for dithers with wcs
                 
@@ -452,6 +507,18 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
                 header[PSF_CUTOUTS_PATH_KEY] = str(save_path)
                 header[PSF_CUTOUTS_SIZE_KEY] = self.psf_cutout_size
             
+            output_dir = get_output_dir(self.output_sub_dir, self.night_sub_dir)
+            output_cat = output_dir.joinpath(
+                image[BASE_NAME_KEY].replace(".fits", ".cat")
+            )
+            
+            header[SEXTRACTOR_HEADER_KEY] = str(output_cat)
+            # header[CALSTEPS] += Sextractor.base_key
+            save_table_as_ldac(
+                tbl = srccat_table,
+                file_path = output_cat
+            )
+            
             image.set_header(header)
             
             metadata = {}
@@ -463,6 +530,39 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             
         return src_batch
 
+class SourcePhotCalibrator(PhotCalibrator):
+    
+    def __init__(
+        self,
+        *args,
+        **kwargs
+    ):  
+        super().__init__(*args,**kwargs)
+        
+    def get_sextractor_apertures(self) -> list[float]:
+        # TODO: do it!
+        return [1.0]
+    
+    def check_prerequisites(self):
+        return True
+    
+    def table_to_fake_image(
+        self,
+        table
+    ):
+        return Image(data=np.zeros([1,1]),header=table.get_metadata())
+    
+    def _apply_to_images(
+        self,
+        batch: SourceBatch,
+    ) -> SourceBatch:
+        
+        batch_fake_images = ImageBatch([self.table_to_fake_image(table) for table in batch])
+        PhotCalibrator._apply_to_images(self,batch_fake_images)
+        
+        return batch
+        
+        
 def load_wifes_guider_fits(
     path: str | Path
 ) -> tuple[np.array, astropy.io.fits.Header]:
@@ -507,10 +607,22 @@ src_det = [
     SourceWriter(output_dir_name=OUTPUT_DIRS['DET'])
 ]
 
+photcal = [
+    SourcePhotCalibrator(
+        ref_catalog_generator=WifesAutoguiderVisier(Gaia).generator,
+        temp_output_sub_dir="phot",
+        crossmatch_radius_arcsec=3.0, # or 2 TODO: test
+        write_regions=True,
+        cache=True,
+        outlier_rejection_threshold=[1.5, 2.0, 3.0],
+    )
+]
+
 test_config = list(itertools.chain(
     load,
     bkg_sub,
-    src_det
+    src_det,
+    photcal
 ))
 
 pipeline = WifesAutoguiderPipeline(night=f"test_{TEST_ID}")
