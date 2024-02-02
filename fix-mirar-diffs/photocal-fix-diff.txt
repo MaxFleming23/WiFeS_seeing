@@ -1,0 +1,13 @@
+--- photcal.py	2024-02-02 17:20:20.134188793 +1100
++++ photcal-fix.py	2024-02-02 17:22:18.241332142 +1100
+@@ -325,8 +325,8 @@
+                 image[MAGLIM_KEY] = limmags[-1]
+ 
+                 image[ZP_KEY] = image["ZP_AUTO"]
+-                image[ZP_STD_KEY] = image["ZP_AUTO_STD"]
+-                image[ZP_NSTARS_KEY] = image["ZP_AUTO_NSTARS"]
++                image[ZP_STD_KEY] = image["ZP_AUTO_std"]
++                image[ZP_NSTARS_KEY] = image["ZP_AUTO_nstars"]
+                 image["MAGSYS"] = "AB"
+ 
+         return batch

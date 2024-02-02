@@ -1,4 +1,5 @@
 .TS H
+.TH
 .TE
 
 .TL
@@ -26,7 +27,7 @@ Developing a robust codebase for consistent analysis across different data sets.
 
 Text
 
-.PSPIC figure.eps
+.PSPIC wifes_autoguider_pipeline.eps
 
 
 .SH METHODOLOGY
@@ -40,7 +41,6 @@ Text
 \&\fBDetermine the image quality:\fR Analyze the stars captured within the images to assess the image quality or "seeing." The methodology will focus on designing an algorithm that is both efficient and resilient to outlier data.
 .IP \(bu
 \&\fBDetermine the ZP (Zero Point) taking into account the exposure time and the filter used:\fR It is crucial to account for potential discrepancies between the filter curve of the acquisition image and those of the external catalogues. This step involves making necessary corrections to ensure accurate measurement of the atmospheric transparency and the image quality.
-.RE
 
 .SH EXPECTED OUTCOMES
 .PP
