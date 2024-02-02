@@ -8,6 +8,7 @@ SEGMOBJ_KEY = 'SEGMOBJ'
 PSF_CUTOUTS_PATH_KEY = 'PCUTPATH'
 PSF_CUTOUTS_SIZE_KEY = 'PCUTSIZE'
 NPSFPATH_KEY = 'NPSFPATH'
+PIXSCALE_KEY = 'PIXSCALE'
 
 sex_all_ground = CustomKernel(np.array([
     [1,2,1],
@@ -49,6 +50,7 @@ class WifesAutoguiderVisier:
         image: Image,
     ) -> VizierCatalog | CatalogFromFile:
         
+        logger.debug(image)
         filter_name = image["FILTER"]
 
         search_radius_arcmin = (
@@ -70,9 +72,17 @@ class WifesAutoguiderVisier:
         )
     
 def wifes_autoguider_photometric_catalog_purifier(
-    
+    catalog: Table,
+    image: Image
 ) -> Table:
-    return 
+    logger.debug('Using filter: wifes_autoguider_photometric_catalog_purifier')
+    logger.debug(catalog)
+    # TODO: filter
+    # clean_mask = np.ones(catalog.to_pandas().shape,dtype=bool)
+    # return catalog[clean_mask]
+    
+    
+    return catalog
 
 class PhotutilsBkgSubtractor(BaseImageProcessor):
     
@@ -444,6 +454,7 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             )
             srccat_table = srccat.to_table()
             
+            pix_scale = np.sqrt(np.abs(np.linalg.det(wcs.pixel_scale_matrix)))
             # TODO: maybe rename col instead of duplicate
             #       or make a table from scratch with only necessary columns
             srccat_table['NUMBER'] = srccat.label
@@ -457,8 +468,6 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             srccat_table['sky_centroid_icrs'] = srccat.sky_centroid_icrs
             srccat_table['sky_centroid_win'] = srccat.sky_centroid_win
             # logger.debug(srccat.sky_centroid_win)
-            srccat_table['ALPHAWIN_J2000'] = [coords.ra for coords in srccat.sky_centroid_win]
-            srccat_table['DELTAWIN_J2000'] = [coords.dec for coords in srccat.sky_centroid_win]
             # cov_eigvals = srccat.covariance_eigvals
             # srccat_table['cov_eigvals'] = cov_eigvals
             # srccat_table['aimage'] = cov_eigvals[0]
@@ -468,6 +477,24 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             srccat_table['THETA_IMAGE'] = srccat.orientation
             srccat_table['kron_aperture'] = srccat.kron_aperture
             
+            # sex compatability
+            srccat_table['ALPHAWIN_J2000'] = [coords.ra for coords in srccat.sky_centroid_win]
+            srccat_table['DELTAWIN_J2000'] = [coords.dec for coords in srccat.sky_centroid_win]
+            srccat_table['X_IMAGE'] = srccat.xcentroid_win
+            srccat_table['Y_IMAGE'] = srccat.ycentroid_win
+            srccat_table['FWHM_IMAGE'] = srccat.fwhm
+            srccat_table['FWHM_WORLD'] = srccat.fwhm * pix_scale
+            
+            # TODO: compute this somehow 
+            aper_mags = {
+            
+            }
+            
+            if len(aper_mags) > 0:
+                srccat_table['MAG_APER'] = np.array(list(aper_mags.values()))
+            srccat_table['MAG_AUTO'] = srccat.kron_flux
+            
+            
             # TODO: CHANGE!!
             srccat_table['FLAGS'] = 0
             
@@ -475,6 +502,7 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             srccat_table[DIFF_IMG_KEY] = image[LATEST_SAVE_KEY] # has to be 
             srccat_table[SCI_IMG_KEY] = '' #image[LATEST_SAVE_KEY]
             srccat_table[REF_IMG_KEY] = ''
+            srccat_table[PIXSCALE_KEY] = pix_scale
     
             if self.make_psf_cutouts:
                 # TODO: check if/what different for dithers with wcs
@@ -526,6 +554,8 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
                 if key != "COMMENT":
                     metadata[key] = image[key]
             
+            if len(aper_mags) > 0:
+                srccat_table['MAG_APER'] = Table(aper_mags)
             src_batch.append(SourceTable(srccat_table.to_pandas(),metadata=metadata))
             
         return src_batch
@@ -541,7 +571,7 @@ class SourcePhotCalibrator(PhotCalibrator):
         
     def get_sextractor_apertures(self) -> list[float]:
         # TODO: do it!
-        return [1.0]
+        return []
     
     def check_prerequisites(self):
         return True
@@ -562,7 +592,6 @@ class SourcePhotCalibrator(PhotCalibrator):
         
         return batch
         
-        
 def load_wifes_guider_fits(
     path: str | Path
 ) -> tuple[np.array, astropy.io.fits.Header]:
@@ -573,6 +602,12 @@ def load_wifes_guider_fits(
     header[GAIN_KEY] = 1
     header['CALSTEPS'] = ''
     header[PROC_FAIL_KEY] = ''
+    if 'RADECSYS' in header:
+        sys = header.pop('RADECSYS')
+        header['RADESYSa'] = sys 
+        header['RADECSYS'] = sys
+    if 'FILTER' not in header:
+        header['FILTER'] = header['TVFILT']
     return data, header
 
 def load_wifes_guider_image(path: str | Path) -> Image:
@@ -615,6 +650,8 @@ photcal = [
         write_regions=True,
         cache=True,
         outlier_rejection_threshold=[1.5, 2.0, 3.0],
+        image_photometric_catalog_purifier=wifes_autoguider_photometric_catalog_purifier,
+        num_matches_threshold=0, # TODO: Change! (testing only ? maybe)
     )
 ]
 
