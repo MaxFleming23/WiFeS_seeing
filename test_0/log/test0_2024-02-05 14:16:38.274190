@@ -5255,3 +5255,21 @@ DEBUG:mirar.processors.sources.source_exporter:Writing SourceTable to /Users/ast
 INFO:mirar.errors.error_stack:No raised errors found in processing
 ERROR:mirar.errors.error_stack:Saving tracebacks of caught errors to /Users/astqx/Desktop/WiFeS/WiFeS_seeing/test_0/test_0_error_stack.txt
 DEBUG:matplotlib.pyplot:Loaded backend module://ipympl.backend_nbagg version unknown.
+DEBUG:matplotlib.pyplot:Loaded backend module://ipympl.backend_nbagg version unknown.
+DEBUG:matplotlib.pyplot:Loaded backend module://ipympl.backend_nbagg version unknown.
+DEBUG:__main__:
+
+2024-02-06 09:10:25.040319
+
+
+DEBUG:__main__:
+
+2024-02-06 09:10:42.764179
+
+
+DEBUG:matplotlib.pyplot:Loaded backend module://ipympl.backend_nbagg version unknown.
+DEBUG:__main__:
+
+2024-02-06 09:10:59.145718
+
+
