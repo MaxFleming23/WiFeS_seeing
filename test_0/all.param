@@ -1,9 +1,12 @@
 ACQ_KEY = 'acq'
 BGMED_KEY = 'BGMED'
 BGRMSMED_KEY = 'BGRMSMED'
-SEGMPATH_KEY = 'SEGMPATH'
+# SEGMPATH_KEY = 'SEGMPATH'
+SEGMPATH_KEY = sextractor_checkimg_map['SEGMENTATION']
 CONVPATH_KEY = 'CONVPATH'
-BGPATH_KEY = 'BGPATH'
+# BGPATH_KEY = 'BGPATH'
+BGPATH_KEY = sextractor_checkimg_map['BACKGROUND']
+BGRMSPATH_KEY = sextractor_checkimg_map['BACKGROUND_RMS']
 SEGMOBJ_KEY = 'SEGMOBJ'
 PSF_CUTOUTS_PATH_KEY = 'PCUTPATH'
 PSF_CUTOUTS_SIZE_KEY = 'PCUTSIZE'
@@ -114,6 +117,8 @@ class PhotutilsBkgSubtractor(BaseImageProcessor):
         select_images: Callable[[ImageBatch], ImageBatch] = default_select_acquisition, #change
         dev: bool = False,
         cache: bool = False,
+        save_bkg: bool = True,
+        save_bkg_rms: bool = True,
     ):
         super().__init__()
         self.box_size = box_size
@@ -132,6 +137,8 @@ class PhotutilsBkgSubtractor(BaseImageProcessor):
         self.output_sub_dir = output_sub_dir
         self.dev = dev
         self.select_images = select_images
+        self.save_bkg = save_bkg
+        self.save_bkg_rms = save_bkg_rms
     
     def _apply_to_images(
         self,
@@ -166,32 +173,42 @@ class PhotutilsBkgSubtractor(BaseImageProcessor):
             bkgsub = data - background_map
             image.set_data(bkgsub)
             
-            save_images = []
+            save_images = {}
             output_dir = get_output_dir(self.output_sub_dir, self.night_sub_dir)
             
+            if self.save_bkg:
+                save_images[BGPATH_KEY] = 'background'
+            
+            if self.save_bkg_rms:
+                save_images[BGRMSPATH_KEY] = 'background_rms'
+            
+            # TODO: 
             if self.cache:
-                save_images = ['background']
+                save_images += ['background']
                 # bkg_image_name = image[BASE_NAME_KEY].replace('fits','background.fits')
                 bkg_image_name = image[BASE_NAME_KEY]+'.background'
                 header[BGPATH_KEY] = str(output_dir.joinpath(bkg_image_name))
                 
             if self.dev:
-                save_images += ['background','background_rms','background_mesh','background_rms_mesh']
+                save_images[sextractor_checkimg_map['MINIBACKGROUND']] = 'background_mesh'
+                save_images[sextractor_checkimg_map['MINIBACK_RMS']] = 'background_rms_mesh'
                 save_name = image[BASE_NAME_KEY].replace('fits','background.pkl')
                 dump_object(
                     data=background,
                     path=output_dir.joinpath(save_name)
                 )
                 
-            for im in save_images:
+            for im in save_images.keys():
                 # save_name = image[BASE_NAME_KEY].replace('fits',im+'.fits')
-                save_name = image[BASE_NAME_KEY]+f".{im}"
+                save_name = image[BASE_NAME_KEY]+f".{save_images[im]}"
+                save_path = output_dir.joinpath(save_name)
                 save_to_path(
-                    data=eval('background.'+im),
+                    data=eval('background.'+save_images[im]),
                     header=image.header,
-                    path=output_dir.joinpath(save_name),
+                    path=save_path,
                     overwrite=True
                 )
+                image[im] = str(save_path)
             
             image.set_header(header)
         
@@ -346,7 +363,7 @@ class PhotutilsSourceFinder(BaseImageProcessor):
             
         return batch
 
-# multiple aperture
+#TODO: multiple aperture
 class PhotutilsSourceCatalog(BaseSourceGenerator):
     """
     Args
@@ -367,7 +384,7 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
         calc_total_error: bool = False,
         error = None, # TODO: [somewhat done] maybe PhotutilsTotalErrorCalculator or calc_total_error internally
         mask = None,
-        wcs = None, # TODO: get it through the image
+        wcs = None, 
         localbkg_width = 15, # default: 0, mirar: 15
         background = None,
         use_background = False,
@@ -485,15 +502,28 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             srccat_table['FWHM_IMAGE'] = srccat.fwhm
             srccat_table['FWHM_WORLD'] = srccat.fwhm * pix_scale
             
+            mag, mag_unc = get_mags_from_fluxes(
+                flux_list = srccat.kron_flux,
+                fluxunc_list = np.zeros(len(srccat_table)),
+                zeropoint = 0.0,
+                zeropoint_unc = 0.0,
+            )
+            srccat_table['MAG_AUTO'] = np.array(mag,dtype=float)
+            
             # TODO: compute this somehow 
             aper_mags = {
             
             }
-            
+        
             if len(aper_mags) > 0:
-                srccat_table['MAG_APER'] = np.array(list(aper_mags.values()))
-            srccat_table['MAG_AUTO'] = srccat.kron_flux
-            
+                aper_fluxes = np.array(list(aper_mags.values()))
+                mag, mag_unc = get_mags_from_fluxes(
+                    flux_list = aper_fluxes,
+                    fluxunc_list = np.zeros(aper_fluxes.shape),
+                    zeropoint = 0.0,
+                    zeropoint_unc = 0.0,
+                )
+                srccat_table['MAG_APER'] = mag
             
             # TODO: CHANGE!!
             srccat_table['FLAGS'] = 0
@@ -587,11 +617,30 @@ class SourcePhotCalibrator(PhotCalibrator):
         batch: SourceBatch,
     ) -> SourceBatch:
         
+        batch_updated = SourceBatch()
+    
         batch_fake_images = ImageBatch([self.table_to_fake_image(table) for table in batch])
-        PhotCalibrator._apply_to_images(self,batch_fake_images)
+        batch_photcal = super()._apply_to_images(batch_fake_images)
         
-        return batch
+        for table, table_updated in zip(batch,batch_photcal):
+            table.metadata = table_updated.get_header()
+            batch_updated.append(table)
+            
+        return batch_updated
+
+class SeeingCalculator(BaseSourceProcessor):
+    
+    def __init__(
+        self,
+    ):
+        super().__init__()
         
+    def _apply_to_sources(
+        self,
+        batch: SourceBatch,
+    ) -> SourceBatch:
+        raise NotImplementedError
+     
 def load_wifes_guider_fits(
     path: str | Path
 ) -> tuple[np.array, astropy.io.fits.Header]:
@@ -622,7 +671,8 @@ bkg_sub = [
         box_size=(10,10),
         select_images=default_select_acquisition,
         output_sub_dir=OUTPUT_DIRS['BKG'],
-        dev=False
+        dev=False,
+        save_bkg=False,
     ),
     ImageSaver(output_dir_name=OUTPUT_DIRS['BKG'])
 ]
@@ -652,7 +702,8 @@ photcal = [
         outlier_rejection_threshold=[1.5, 2.0, 3.0],
         image_photometric_catalog_purifier=wifes_autoguider_photometric_catalog_purifier,
         num_matches_threshold=0, # TODO: Change! (testing only ? maybe)
-    )
+    ),
+    SourceWriter(output_dir_name=OUTPUT_DIRS['PHOTCAL'])
 ]
 
 test_config = list(itertools.chain(
