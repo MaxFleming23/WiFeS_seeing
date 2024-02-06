@@ -39,6 +39,9 @@ def dump_object(data,path):
     with open(path,'wb') as file:
         return pickle.dump(data,file)
 
+def table_to_fake_image(table):
+    return Image(data=np.zeros([1,1]),header=table.get_metadata())
+
 class WifesAutoguiderVisier:
     
     def __init__(
@@ -80,7 +83,6 @@ def wifes_autoguider_photometric_catalog_purifier(
     image: Image
 ) -> Table:
     logger.debug('Using filter: wifes_autoguider_photometric_catalog_purifier')
-    logger.debug(catalog)
     # TODO: filter
     # clean_mask = np.ones(catalog.to_pandas().shape,dtype=bool)
     # return catalog[clean_mask]
@@ -591,6 +593,249 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             
         return src_batch
 
+class SourceCrossMatch(BaseProcessorWithCrossMatch):
+    
+    def __init__(
+        self,
+        ref_catalog_generator: Callable[[Image], BaseCatalog],
+        temp_output_sub_dir: str = "phot",
+        image_photometric_catalog_purifier: Callable[
+            [Table, Image], Table
+        ] = default_image_sextractor_catalog_purifier,
+        crossmatch_radius_arcsec: float = 1.0,
+        write_regions: bool = False,
+        cache: bool = False,
+        ref_cat_cols = None,
+    ):
+        super().__init__(
+            ref_catalog_generator=ref_catalog_generator,
+            temp_output_sub_dir=temp_output_sub_dir,
+            crossmatch_radius_arcsec=crossmatch_radius_arcsec,
+            sextractor_catalog_purifier=image_photometric_catalog_purifier,
+            write_regions=write_regions,
+            cache=cache,
+            required_parameters=REQUIRED_PARAMETERS,
+        )
+        self.ref_cat_cols = ref_cat_cols
+        
+    def check_prerequisites(self):
+        return True
+        
+    def _apply_to_images(
+        self,
+        batch: SourceBatch
+    ) -> SourceBatch:
+        
+        batch_updated = SourceBatch()
+        
+        for table in batch:
+            ref_cat, _, cleaned_img_cat = self.setup_catalogs(table_to_fake_image(table))
+            matched_img_cat, matched_ref_cat, _ = self.xmatch_catalogs(
+                ref_cat=ref_cat,
+                image_cat=cleaned_img_cat,
+                crossmatch_radius_arcsec=self.crossmatch_radius_arcsec, #2-3 arcsec
+            )
+            
+            for cols in self.ref_cat_cols:
+                matched_img_cat[cols] = matched_ref_cat[cols]
+            
+            matched_img_table = SourceTable(matched_img_cat.to_pandas(),metadata=table.metadata)
+            batch_updated.append(matched_img_table)
+            
+        return batch_updated
+
+class PhotutilsModelPSF(BaseSourceProcessor):
+    
+    base_key = 'photutils_model_psf'
+    
+    def __init__(
+        self,
+        oversampling=4, # don't oversample unless necessary*
+        shape=None, # needs to be checked (edge pixles)
+        shape_from_cutout: bool = False,
+        smoothing_kernel='quartic', 
+        recentering_func=centroid_com, 
+        recentering_maxiters=20, 
+        fitter=LMLSQFitter,
+        fitter_params=dict(),
+        fitter_kwargs=dict(),
+        maxiters=10, 
+        norm_radius=5.5, 
+        recentering_boxsize=(5, 5), 
+        center_accuracy=0.001, 
+        sigma_clip=SigmaClip(
+            sigma=3, 
+            sigma_lower=3, 
+            sigma_upper=3, 
+            maxiters=10, 
+            cenfunc='median', 
+            stdfunc='std', 
+            grow=False
+        ),
+        progress_bar=False, 
+        fit_boxsize=5, # EPSFFitter default 
+        psf_cutout_size: int = 21, 
+        psf_cutout_size_auto: bool = False,
+        make_psf_cutouts_from_catalog: bool = False,
+        make_psf_cutouts: bool = True, # TODO: implement star detection/local peak finding to detect point-like objects specifically
+        dev = False,
+        output_sub_dir: Path | str = 'psf_model',
+        cache: bool = False,
+    ):
+        super().__init__()
+        self.cache=cache
+        self.output_sub_dir = output_sub_dir
+        self.oversampling=oversampling
+        self.shape=shape
+        self.smoothing_kernel=smoothing_kernel
+        self.recentering_func=recentering_func
+        self.recentering_maxiters=recentering_maxiters
+        self.fitter=fitter
+        self.fitter_params=fitter_params
+        self.fitter_kwargs=fitter_kwargs
+        self.maxiters=maxiters
+        self.norm_radius=norm_radius
+        self.recentering_boxsize=recentering_boxsize
+        self.center_accuracy=center_accuracy
+        self.sigma_clip=sigma_clip
+        self.progress_bar=progress_bar
+        self.fit_boxsize=fit_boxsize
+        self.dev = dev
+        self.psf_cutout_size = psf_cutout_size
+        self.make_psf_cutouts = make_psf_cutouts
+        self.make_psf_cutouts_from_catalog = make_psf_cutouts_from_catalog
+        self.psf_cutout_size_auto = psf_cutout_size_auto
+        
+    def _apply_to_sources(
+        self,
+        batch: SourceBatch,
+    ) -> SourceBatch:
+        
+        batch_updated = SourceBatch()
+        
+        for table in batch:
+            
+            data = table.get_data()
+            metadata = table.get_metadata()
+            image_data = fits.getdata(metadata[LATEST_SAVE_KEY])
+            
+            suffix = '.cutouts.pkl'
+            fwhm_avg, fwhm_med, fwhm_std = sigma_clipped_stats(data['fwhm'])
+            
+            if self.psf_cutout_size_auto:
+                psf_cutout_size = int(np.round(fwhm_avg) + 2*fwhm_std)*3
+            else:
+                psf_cutout_size = self.psf_cutout_size
+            
+            # update to use PSF_CUTOUTS_PATH_KEY
+            # stars_file = Path(table[LATEST_SAVE_KEY]).parent.joinpath(table[BASE_NAME_KEY]+suffix)
+            if PSF_CUTOUTS_PATH_KEY in metadata:
+                stars_file = metadata[PSF_CUTOUTS_PATH_KEY]
+                with open(stars_file,'rb') as file:
+                    stars = pickle.load(file)
+            
+            elif self.make_psf_cutouts_from_catalog:
+                twiddle_keys = {
+                    'label': 'id',
+                    'xcentroid': 'x',
+                    'ycentroid': 'y'
+                }
+                # data.rename(twiddle_keys, axis='columns')
+                
+                stars_catalog = Table.from_pandas(data[list(twiddle_keys.keys())])
+                for key in twiddle_keys.keys():
+                    stars_catalog.rename_column(key,twiddle_keys[key])
+                
+                stars = extract_stars( 
+                    data=NDData(data=image_data),
+                    # catalogs=data[*twiddle_keys.values()],
+                    catalogs=stars_catalog,
+                    size=psf_cutout_size
+                )
+                
+                # twiddle <--
+                # data.rename({v: k for k, v in twiddle_keys.items()}, axis='columns')
+                
+                save_name = metadata[BASE_NAME_KEY]+'.cutouts.pkl'
+                output_dir = get_output_dir(self.output_sub_dir, self.night_sub_dir)
+                save_path = output_dir.joinpath(save_name)
+                with open(save_path,'wb') as file:
+                    pickle.dump(stars,file)
+                
+                metadata[PSF_CUTOUTS_PATH_KEY] = str(save_path)
+                metadata[PSF_CUTOUTS_SIZE_KEY] = self.psf_cutout_size
+        
+            if self.fit_boxsize is None:
+                fit_boxsize = int(np.round(fwhm_avg))*2
+            else:
+                fit_boxsize = self.fit_boxsize
+                
+            fitter = EPSFFitter(
+                fitter=self.fitter(**self.fitter_params),
+                fit_boxsize=fit_boxsize,
+                **self.fitter_kwargs
+            )
+            
+            epsf_builder = EPSFBuilder(
+                oversampling=self.oversampling,
+                shape=self.shape,
+                smoothing_kernel=self.smoothing_kernel,
+                recentering_func=self.recentering_func,
+                recentering_maxiters=self.recentering_maxiters,
+                fitter=fitter,
+                maxiters=self.maxiters,
+                norm_radius=self.norm_radius,
+                recentering_boxsize=self.recentering_boxsize,
+                center_accuracy=self.center_accuracy,
+                sigma_clip=self.sigma_clip,
+                progress_bar=self.progress_bar
+            )
+            epsf, fitted_stars = epsf_builder(stars)
+            
+            output_dir = get_output_dir(self.output_sub_dir, self.night_sub_dir)
+            epsf_save_path = output_dir.joinpath(table[BASE_NAME_KEY].replace('fits','psfmodel.pkl'))
+            with open(epsf_save_path,'wb') as file:
+                pickle.dump(epsf, file)
+                
+            table[NPSFPATH_KEY] = str(epsf_save_path)
+            
+            if self.dev:
+                # ? dev - maybe move to main
+                data['psf_center_flat'] = np.full(data.shape[0],np.nan)
+                for i,star in enumerate(fitted_stars.all_good_stars):
+                    data.at[star.id_label-1,'psf_center_flat'] = str(fitted_stars.center_flat[i])
+                
+                # dev
+                epsf_img_save_path = str(epsf_save_path).replace('pkl','fits')
+                save_to_path(
+                    data=epsf.data,
+                    header=None,
+                    path=epsf_img_save_path,
+                    overwrite=True
+                )
+                
+                save_suffix = suffix.replace('cutouts','cutouts.fitted')
+                save_path = output_dir.joinpath(table[BASE_NAME_KEY]+save_suffix)
+                with open(save_path,'wb') as file:
+                    pickle.dump(fitted_stars, file)
+            
+            table.set_data(data)
+            batch_updated.append(table)
+            
+        return batch_updated
+
+def wifes_autoguider_gal_filter(
+    batch: SourceBatch
+) -> SourceBatch:
+    batch_updated = SourceBatch()
+    
+    for table in batch:
+        data = table.get_data()
+        data = data[data['Gal'] == 0]
+        batch_updated.append(SourceTable(data,metadata=table.metadata))
+    
+    return batch_updated  
+
 class SourcePhotCalibrator(PhotCalibrator):
     
     def __init__(
@@ -776,8 +1021,8 @@ class SourcePhotCalibrator(PhotCalibrator):
                 for zpvals in zp_dicts:
                     image[f"ZP_{zpvals['diameter']}"] = zpvals["zp_mean"]
                     image[f"ZP_{zpvals['diameter']}_std"] = zpvals["zp_std"]
-                    image[f"ZP_{zpvals['diameter']}_nstars"] = zpvals["nstars"]
                     image[f"ZP_{zpvals['diameter']}_mad"] = zpvals["zp_mad"]
+                    image[f"ZP_{zpvals['diameter']}_nstars"] = zpvals["nstars"]
                     try:
                         aperture_diameters.append(float(zpvals["diameter"]))
                         zp_values.append(zpvals["zp_mean"])
@@ -808,8 +1053,8 @@ class SourcePhotCalibrator(PhotCalibrator):
                 # image[ZP_STD_KEY] = image["ZP_AUTO_STD"]
                 image[ZP_STD_KEY] = image["ZP_AUTO_std"]
                 # image[ZP_NSTARS_KEY] = image["ZP_AUTO_NSTARS"]
-                image[ZP_NSTARS_KEY] = image["ZP_AUTO_nstars"]
                 image[ZP_MAD_KEY] = image["ZP_AUTO_mad"]
+                image[ZP_NSTARS_KEY] = image["ZP_AUTO_nstars"]
                 # [!] 
                 image["MAGSYS"] = "AB"
 
@@ -896,6 +1141,34 @@ src_det = [
     SourceWriter(output_dir_name=OUTPUT_DIRS['DET'])
 ]
 
+xmatch = [
+    SourceCrossMatch(
+        ref_catalog_generator=WifesAutoguiderVisier(Gaia).generator,
+        temp_output_sub_dir="phot",
+        crossmatch_radius_arcsec=3.0, # or 2 TODO: test
+        write_regions=True,
+        cache=True,
+        image_photometric_catalog_purifier=wifes_autoguider_photometric_catalog_purifier,
+        ref_cat_cols=['Gal']
+    ),
+    CustomSourceTableModifier(modifier_function=wifes_autoguider_gal_filter),
+    # SourceWriter(output_dir_name=OUTPUT_DIRS['XMAT'])
+]
+
+psfmodel = [
+    PhotutilsModelPSF(
+        # oversampling=1,
+        make_psf_cutouts_from_catalog=True,
+        dev = True,
+        cache=True,
+        output_sub_dir=OUTPUT_DIRS['PSF_MODEL'],
+        fitter=TRFLSQFitter,
+        # fitter_params={'calc_uncertainties':True},
+        # fitter_kwargs=dict(),
+        # shape=None,
+    )
+]
+
 photcal = [
     SourcePhotCalibrator(
         ref_catalog_generator=WifesAutoguiderVisier(Gaia).generator,
@@ -914,7 +1187,9 @@ test_config = list(itertools.chain(
     load,
     bkg_sub,
     src_det,
-    photcal
+    # photcal
+    xmatch,
+    psfmodel
 ))
 
 pipeline = WifesAutoguiderPipeline(night=f"test_{TEST_ID}")
