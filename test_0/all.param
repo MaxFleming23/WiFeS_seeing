@@ -540,7 +540,6 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             srccat_table[DIFF_IMG_KEY] = image[LATEST_SAVE_KEY] # has to be 
             srccat_table[SCI_IMG_KEY] = '' #image[LATEST_SAVE_KEY]
             srccat_table[REF_IMG_KEY] = ''
-            srccat_table[PIXSCALE_KEY] = pix_scale
     
             if self.make_psf_cutouts:
                 # TODO: check if/what different for dithers with wcs
@@ -591,6 +590,8 @@ class PhotutilsSourceCatalog(BaseSourceGenerator):
             for key in image.keys():
                 if key != "COMMENT":
                     metadata[key] = image[key]
+                    
+            metadata[PIXSCALE_KEY] = pix_scale
             
             if len(aper_mags) > 0:
                 srccat_table['MAG_APER'] = Table(aper_mags)
@@ -1168,7 +1169,7 @@ xmatch = [
 
 psfmodel = [
     PhotutilsModelPSF(
-        oversampling=4,
+        oversampling=8,
         make_psf_cutouts_from_catalog=True,
         psf_cutout_size_auto=True,
         # psf_cutout_size=41,
@@ -1176,7 +1177,7 @@ psfmodel = [
         cache=True,
         output_sub_dir=OUTPUT_DIRS['PSF_MODEL'],
         fitter=TRFLSQFitter,
-        # fit_boxsize=5,
+        # fit_boxsize=5*8+1,
         # fitter_params={'calc_uncertainties':True},
         # fitter_kwargs=dict(),
         # shape=None,
