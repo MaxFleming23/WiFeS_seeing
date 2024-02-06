@@ -13,6 +13,8 @@ PSF_CUTOUTS_SIZE_KEY = 'PCUTSIZE'
 NPSFPATH_KEY = 'NPSFPATH'
 PIXSCALE_KEY = 'PIXSCALE'
 ZP_MAD_KEY = 'ZPMAD'
+PSFFIT_FWHM_AVG = 'PSF_FIT_FWHM_AVG'
+SEEING_KEY = 'SEEING'
 
 sex_all_ground = CustomKernel(np.array([
     [1,2,1],
@@ -41,6 +43,9 @@ def dump_object(data,path):
 
 def table_to_fake_image(table):
     return Image(data=np.zeros([1,1]),header=table.get_metadata())
+
+def save_night_log_seeing(table):
+    return
 
 class WifesAutoguiderVisier:
     
@@ -719,11 +724,17 @@ class PhotutilsModelPSF(BaseSourceProcessor):
             metadata = table.get_metadata()
             image_data = fits.getdata(metadata[LATEST_SAVE_KEY])
             
+            if len(table) == 0:
+                table[SEEING_KEY] = 'undetermined'
+                logger.debug(f"{metadata[BASE_NAME_KEY]} has no cross-matched sources")
+                continue
+            
             suffix = '.cutouts.pkl'
             fwhm_avg, fwhm_med, fwhm_std = sigma_clipped_stats(data['fwhm'])
             
             if self.psf_cutout_size_auto:
-                psf_cutout_size = int(np.round(fwhm_avg) + 2*fwhm_std)*3
+                psf_cutout_size = int(np.round(fwhm_med) + 2*fwhm_std)*3
+                psf_cutout_size += int(psf_cutout_size%2 - 1)
             else:
                 psf_cutout_size = self.psf_cutout_size
             
@@ -762,11 +773,11 @@ class PhotutilsModelPSF(BaseSourceProcessor):
                 with open(save_path,'wb') as file:
                     pickle.dump(stars,file)
                 
-                metadata[PSF_CUTOUTS_PATH_KEY] = str(save_path)
-                metadata[PSF_CUTOUTS_SIZE_KEY] = self.psf_cutout_size
+                table[PSF_CUTOUTS_PATH_KEY] = str(save_path)
+                table[PSF_CUTOUTS_SIZE_KEY] = self.psf_cutout_size
         
             if self.fit_boxsize is None:
-                fit_boxsize = int(np.round(fwhm_avg))*2
+                fit_boxsize = int(np.round(fwhm_med))
             else:
                 fit_boxsize = self.fit_boxsize
                 
@@ -1157,16 +1168,20 @@ xmatch = [
 
 psfmodel = [
     PhotutilsModelPSF(
-        # oversampling=1,
+        oversampling=4,
         make_psf_cutouts_from_catalog=True,
+        psf_cutout_size_auto=True,
+        # psf_cutout_size=41,
         dev = True,
         cache=True,
         output_sub_dir=OUTPUT_DIRS['PSF_MODEL'],
         fitter=TRFLSQFitter,
+        # fit_boxsize=5,
         # fitter_params={'calc_uncertainties':True},
         # fitter_kwargs=dict(),
         # shape=None,
-    )
+    ),
+    SourceWriter(output_dir_name=OUTPUT_DIRS['PSF_MODEL'])
 ]
 
 photcal = [
