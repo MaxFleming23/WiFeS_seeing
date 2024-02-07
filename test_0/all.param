@@ -13,8 +13,13 @@ PSF_CUTOUTS_SIZE_KEY = 'PCUTSIZE'
 NPSFPATH_KEY = 'NPSFPATH'
 PIXSCALE_KEY = 'PIXSCALE'
 ZP_MAD_KEY = 'ZPMAD'
-PSFFIT_FWHM_AVG = 'PSF_FIT_FWHM_AVG'
 SEEING_KEY = 'SEEING'
+PSFMODEL_FWHM_PIX_KEY = 'PSF_FWHM_PIX'
+PSFMODEL_FWHM_KEY = 'PSF_FWHM'
+PSFMODEL_FWHM_ARCSEC_KEY = 'PSF_FWHM_ARCSEC'
+PSFMODEL_ELLIPTICITY_KEY = 'PSF_ELLIPTICITY'
+OVERSAMPLE_KEY = 'OVERSAMPLE'
+XMATCH_NSTARS_KEY = 'XMATCH_NSTARS'
 
 sex_all_ground = CustomKernel(np.array([
     [1,2,1],
@@ -44,10 +49,68 @@ def dump_object(data,path):
 def table_to_fake_image(table):
     return Image(data=np.zeros([1,1]),header=table.get_metadata())
 
-def save_night_log_seeing(table):
-    return
+def fwhm_from_gaussian(
+    table: SourceTable,
+    fitted_model: Gaussian2D
+) -> SourceTable:
+    pix_scale = table[PIXSCALE_KEY]
 
-class WifesAutoguiderVisier:
+    std_x = fitted_model.x_stddev
+    std_y = fitted_model.y_stddev
+
+    fwhm_pix = 2*np.sqrt(np.log(2)*(std_x**2 + std_y**2))
+    fwhm_deg = fwhm_pix*pix_scale 
+    fwhm_arcsec = fwhm_deg*3600
+    
+    table[PSFMODEL_ELLIPTICITY_KEY] = 1 - min(std_x,std_y)/max(std_x,std_y)
+    
+    table[PSFMODEL_FWHM_PIX_KEY] = fwhm_pix
+    table[PSFMODEL_FWHM_KEY] = fwhm_deg
+    table[PSFMODEL_FWHM_ARCSEC_KEY] = fwhm_arcsec
+    
+    return table
+
+def save_night_log_seeing(
+    table: SourceTable,
+    output_dir: Path | str,
+    additional_cols = None,
+):  
+    
+    log_name = 'seeing.log.csv'
+    log_path = os.path.join(output_dir, log_name)
+    
+    data = {
+        TIME_KEY: table[TIME_KEY],
+        TARGET_KEY: table[TARGET_KEY],
+        FILTER_KEY: table[FILTER_KEY],
+        EXPTIME_KEY: table[EXPTIME_KEY],
+        XMATCH_NSTARS_KEY: table[XMATCH_NSTARS_KEY],
+        PSFMODEL_FWHM_ARCSEC_KEY: table[PSFMODEL_FWHM_ARCSEC_KEY],
+        PSFMODEL_FWHM_PIX_KEY: table[PSFMODEL_FWHM_PIX_KEY],
+        PSFMODEL_ELLIPTICITY_KEY: table[PSFMODEL_ELLIPTICITY_KEY]
+    }
+    
+    metadata = table.get_metadata()
+    if additional_cols is not None:
+        for col in additional_cols:
+            if col in metadata:
+                data[col] = table[col]
+            else:
+                data[col] = str(None)
+    
+    df = pd.DataFrame(data,index=[0])
+    
+    # df[ZP_NSTARS_KEY] = table[]
+    # df[ZP_MAD] = table[]
+    # df[ZP_STD] = table[]
+    # df[ZP] = table[]
+    
+    if os.path.exists(log_path):
+        df.to_csv(log_path, mode='a', header=False)
+    else:
+        df.to_csv(log_path)
+
+class WifesAutoguiderVisier():
     
     def __init__(
         self,
@@ -63,7 +126,7 @@ class WifesAutoguiderVisier:
     ) -> VizierCatalog | CatalogFromFile:
         
         logger.debug(image)
-        filter_name = image["FILTER"]
+        filter_name = image[FILTER_KEY]
 
         search_radius_arcmin = (
             np.max([image["NAXIS1"], image["NAXIS2"]])
@@ -72,8 +135,8 @@ class WifesAutoguiderVisier:
         ) / 2.0
         
         # TODO: match closest
-        if filter_name == 'I':
-            filter_name = 'RP'
+        if self.visier_catalog.abbreviation == 'gaiadr3':
+            filter_name = self.visier_catalog.UBVRI_GAIA_FILTERS[filter_name]
 
         return self.visier_catalog(
             min_mag=10,
@@ -646,6 +709,10 @@ class SourceCrossMatch(BaseProcessorWithCrossMatch):
                 matched_img_cat[cols] = matched_ref_cat[cols]
             
             matched_img_table = SourceTable(matched_img_cat.to_pandas(),metadata=table.metadata)
+            
+            nan_mask = ~np.isnan(matched_img_cat['label'])
+            matched_img_table[XMATCH_NSTARS_KEY] = len(matched_img_cat[nan_mask])
+            
             batch_updated.append(matched_img_table)
             
         return batch_updated
@@ -809,7 +876,8 @@ class PhotutilsModelPSF(BaseSourceProcessor):
             with open(epsf_save_path,'wb') as file:
                 pickle.dump(epsf, file)
                 
-            table[NPSFPATH_KEY] = str(epsf_save_path)
+            table[NPSFPATH_KEY] = str(epsf_save_path) # save fits to this header and create a new header for object
+            table[OVERSAMPLE_KEY] = self.oversampling
             
             if self.dev:
                 # ? dev - maybe move to main
@@ -1091,16 +1159,76 @@ class SourcePhotCalibrator(PhotCalibrator):
 
 class SeeingCalculator(BaseSourceProcessor):
     
+    base_key = "seeing_calculator"
+    
     def __init__(
         self,
+        model_size: int = 21,
+        x_stddev_guess: int = 5,
+        y_stddev_guess: int = 5,
+        output_sub_dir: Path | str = 'seeing',
+        additional_cols = None,
+        dev: bool = False,
     ):
         super().__init__()
+        self.model_size = model_size
+        self.x_stddev_guess = x_stddev_guess
+        self.y_stddev_guess = y_stddev_guess
+        self.output_sub_dir = output_sub_dir
+        self.additional_cols = additional_cols
+        self.dev = dev
+    
+    def fit_gaussian(
+        self,
+        table: SourceTable,
+    ) -> Gaussian2D:
+        
+        prec = table[OVERSAMPLE_KEY]
+        size = self.model_size*prec
+        x, y = np.mgrid[0:size, 0:size]/prec
+        center = (size//2/prec,size//2/prec)
+
+        psfmodel = load_object(table[NPSFPATH_KEY])
+        psf_array = psfmodel.evaluate(x,y,1,*center)
+        
+        model = Gaussian2D(
+            amplitude=np.max(psf_array),
+            x_mean=center[0],
+            y_mean=center[1],
+            x_stddev=self.x_stddev_guess, 
+            y_stddev=self.y_stddev_guess
+        )
+        fitter = TRFLSQFitter(calc_uncertainties=True)
+        fitted_model = fitter(model,x,y,psf_array)
+        
+        if self.dev:
+            output_dir = get_output_dir(self.output_sub_dir, self.night_sub_dir)
+            save_path = output_dir.joinpath(table[BASE_NAME_KEY].replace('fits','psf_fitted_gaussian.pkl'))
+            dump_object(fitted_model,save_path)
+        
+        return fitted_model
         
     def _apply_to_sources(
         self,
         batch: SourceBatch,
     ) -> SourceBatch:
-        raise NotImplementedError
+        
+        batch_updated = SourceBatch()
+        
+        for table in batch:
+            table_updated = fwhm_from_gaussian(
+                table=table,
+                fitted_model=self.fit_gaussian(table)
+            )
+            output_dir = self.night_sub_dir
+            save_night_log_seeing(
+                table_updated,
+                output_dir,
+                additional_cols=self.additional_cols
+            )
+            batch_updated.append(table_updated)
+        
+        return batch_updated
      
 def load_wifes_guider_fits(
     path: str | Path
@@ -1110,14 +1238,14 @@ def load_wifes_guider_fits(
     header[TARGET_KEY] = header['OBJECT']
     header[COADD_KEY] = 1
     header[GAIN_KEY] = 1
-    header['CALSTEPS'] = ''
+    header['CALSTEPS'] = '' # find path
     header[PROC_FAIL_KEY] = ''
     if 'RADECSYS' in header:
         sys = header.pop('RADECSYS')
         header['RADESYSa'] = sys 
         header['RADECSYS'] = sys
-    if 'FILTER' not in header:
-        header['FILTER'] = header['TVFILT']
+    if FILTER_KEY not in header:
+        header[FILTER_KEY] = header['TVFILT']
     return data, header
 
 def load_wifes_guider_image(path: str | Path) -> Image:
@@ -1185,6 +1313,14 @@ psfmodel = [
     SourceWriter(output_dir_name=OUTPUT_DIRS['PSF_MODEL'])
 ]
 
+seeing = [
+    SeeingCalculator(
+        output_sub_dir = OUTPUT_DIRS['SEE'],
+        additional_cols=['OBSBLKID','PROPID','RA','DEC']
+    ),
+    SourceWriter(output_dir_name=OUTPUT_DIRS['SEE'])
+]
+
 photcal = [
     SourcePhotCalibrator(
         ref_catalog_generator=WifesAutoguiderVisier(Gaia).generator,
@@ -1205,7 +1341,8 @@ test_config = list(itertools.chain(
     src_det,
     # photcal
     xmatch,
-    psfmodel
+    psfmodel,
+    seeing,
 ))
 
 pipeline = WifesAutoguiderPipeline(night=f"test_{TEST_ID}")
